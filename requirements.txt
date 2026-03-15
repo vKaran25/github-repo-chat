@@ -1,0 +1,16 @@
+gitingest
+streamlit
+
+# LangChain
+langchain
+langchain-core
+langchain-community
+langchain-groq
+langchain-huggingface
+langchain-text-splitters
+
+# Embeddings
+sentence-transformers
+
+# Vector store
+faiss-cpu

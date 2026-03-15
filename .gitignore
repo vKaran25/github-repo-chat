@@ -1,0 +1,54 @@
+# =============================================================================
+# .gitignore — GitHub RAG project
+# =============================================================================
+
+# ── Secrets — NEVER commit these ─────────────────────────────────────────────
+.env
+.env.*
+*.key
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pdb
+
+# ── Virtual environments ──────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── HuggingFace & embedding cache ────────────────────────────────────────────
+# Model weights download to ~/.cache/huggingface/ — outside project, fine
+# embedding_cache/ is local disk cache from CacheBackedEmbeddings
+embedding_cache/
+
+# ── FAISS index files (if saved to disk) ─────────────────────────────────────
+*.faiss
+*.pkl
+*.index
+
+# ── OS files ─────────────────────────────────────────────────────────────────
+.DS_Store           # macOS
+Thumbs.db           # Windows
+desktop.ini         # Windows
+
+# ── IDE / Editor ─────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── Streamlit ─────────────────────────────────────────────────────────────────
+.streamlit/secrets.toml
+
+# ── Logs ─────────────────────────────────────────────────────────────────────
+*.log
+logs/
+
+# ── Test / coverage ───────────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
