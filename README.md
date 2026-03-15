@@ -4,12 +4,6 @@
 
 🔗 **[Live Demo](https://chatgitrepo.streamlit.app)**
 
----
-
-![App Screenshot](assets/screenshot.png)
-
----
-
 ## What It Does
 
 Paste any public GitHub repository URL and start asking questions about it:
