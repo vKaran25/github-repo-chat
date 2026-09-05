@@ -26,6 +26,14 @@ from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
+from langchain_community.retrievers import BM25Retriever
+try:
+    from langchain.retrievers import EnsembleRetriever
+except (ImportError, ModuleNotFoundError):
+    try:
+        from langchain.retrievers.ensemble import EnsembleRetriever
+    except (ImportError, ModuleNotFoundError):
+        from langchain_classic.retrievers import EnsembleRetriever
 from filter import filter_content       # ← strips node_modules, lock files, binaries etc.
 
 
@@ -123,14 +131,59 @@ def build_vectorstore(chunks: list[Document]) -> FAISS:
 
 
 # =============================================================================
+# STEP 5 — Build hybrid retriever (BM25 + FAISS EnsembleRetriever)
+# =============================================================================
+#
+# BM25Retriever   → keyword/exact-match search (in-memory inverted index)
+# FAISS retriever → dense semantic search (vector similarity)
+# EnsembleRetriever → merges both lists via Reciprocal Rank Fusion (RRF)
+#
+# weights=[0.4, 0.6]:
+#   BM25  contributes 40% of the ranking score
+#   FAISS contributes 60% of the ranking score
+#   (FAISS weighted higher because semantic search is more useful for code Q&A)
+#
+# k=5 on each retriever: each returns 5 chunks independently.
+# After dedup + RRF, the ensemble returns up to 10 unique chunks ranked by fused score.
+# =============================================================================
+
+def build_hybrid_retriever(chunks: list[Document]) -> EnsembleRetriever:
+    # ── BM25: keyword search ──────────────────────────────────────────────────
+    # from_documents() tokenises each chunk's page_content and builds an
+    # in-memory BM25 index. No model download, no HTTP — pure Python.
+    bm25_retriever = BM25Retriever.from_documents(chunks)
+    bm25_retriever.k = 5
+
+    # ── FAISS: dense semantic search ──────────────────────────────────────────
+    # Same vectorstore build as before, then wrapped as a retriever.
+    vectorstore = build_vectorstore(chunks)
+    faiss_retriever = vectorstore.as_retriever(
+        search_type="similarity",
+        search_kwargs={"k": 5}
+    )
+
+    print("🔀 Building EnsembleRetriever (BM25 + FAISS)...")
+
+    # ── Ensemble: fuse results via RRF ────────────────────────────────────────
+    # weights order matches retrievers order: [bm25_weight, faiss_weight]
+    ensemble = EnsembleRetriever(
+        retrievers=[bm25_retriever, faiss_retriever],
+        weights=[0.4, 0.6]
+    )
+
+    print("✅ Hybrid retriever ready!")
+    return ensemble
+
+
+# =============================================================================
 # PUBLIC ENTRY POINT — called by app.py
 # =============================================================================
 
-def ingest_github_repo(github_url: str) -> FAISS:
+def ingest_github_repo(github_url: str) -> EnsembleRetriever:
     """
-    Full pipeline: GitHub URL → filtered → chunked → embedded → FAISS index.
+    Full pipeline: GitHub URL → filtered → chunked → hybrid retriever.
+    Returns an EnsembleRetriever (BM25 + FAISS) ready to be passed to chain.py.
     """
     docs   = load_repo_as_document(github_url)
     chunks = split_documents(docs)
-    store  = build_vectorstore(chunks)
-    return store
+    return build_hybrid_retriever(chunks)
