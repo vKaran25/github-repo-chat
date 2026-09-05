@@ -85,10 +85,10 @@ with st.sidebar:
         else:
             with st.spinner("Fetching & indexing repo... (may take 20-30s)"):
                 try:
-                    vectorstore = ingest_github_repo(github_url)
+                    retriever = ingest_github_repo(github_url)
 
                     # api_key passed directly — no .env needed
-                    st.session_state.chain = build_rag_chain(vectorstore, groq_api_key.strip())
+                    st.session_state.chain = build_rag_chain(retriever, groq_api_key.strip())
 
                     st.session_state.messages = []
                     reset_memory(SESSION_ID)

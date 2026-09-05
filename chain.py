@@ -7,6 +7,9 @@
 #   - ChatGroq receives api_key directly instead of reading from .env
 #   - This allows users to bring their own Groq API key via the UI
 #   - load_dotenv() removed — no longer needed for deployment
+#   - get_retriever() removed — retriever is now built in ingest.py
+#     (build_hybrid_retriever) and passed in as an EnsembleRetriever
+#   - FAISS import removed — no longer referenced in this file
 #
 # EVERYTHING LIVES HERE:
 #   - Memory storage (store dict, get_session_history, reset_memory)
@@ -14,11 +17,10 @@
 #   - Memory wrapping (RunnableWithMessageHistory)
 #
 # WHAT app.py IMPORTS FROM HERE:
-#   build_rag_chain(vectorstore, api_key) → builds the full chain with memory
-#   reset_memory()                        → called when user indexes a new repo
+#   build_rag_chain(retriever, api_key) → builds the full chain with memory
+#   reset_memory()                      → called when user indexes a new repo
 # =============================================================================
 
-from langchain_community.vectorstores import FAISS
 from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.output_parsers import StrOutputParser
@@ -75,15 +77,6 @@ def reset_memory(session_id: str = "default") -> None:
 # SECTION 2 — RAG PIPELINE
 # =============================================================================
 
-def get_retriever(vectorstore: FAISS):
-    # Wraps FAISS: string query → top-k most relevant Documents
-    # k=5 → return 5 most similar chunks per question
-    return vectorstore.as_retriever(
-        search_type="similarity",
-        search_kwargs={"k": 5}
-    )
-
-
 RAG_PROMPT = ChatPromptTemplate.from_messages([
     ("system", """You are a helpful code assistant. A user is exploring a GitHub repository and asking questions about it.
 
@@ -130,19 +123,19 @@ def extract_sources(docs: list) -> list[str]:
 # SECTION 3 — BUILD CHAIN WITH MEMORY
 # =============================================================================
 
-def build_rag_chain(vectorstore: FAISS, api_key: str):
+def build_rag_chain(retriever, api_key: str):
     """
     Builds and returns the full RAG chain with memory.
 
     WHAT CHANGED:
-      Now accepts api_key parameter and passes it directly to ChatGroq.
-      This means no .env file needed — users provide their key via the UI.
-      Safe for deployment: key is used per-request, never stored.
+      - Accepts a pre-built retriever (EnsembleRetriever from ingest.py)
+        instead of a raw FAISS vectorstore.
+      - get_retriever() is gone — retriever construction now lives in
+        ingest.py's build_hybrid_retriever().
+      - api_key is still passed directly from the UI. No .env needed.
 
     Returns: {"answer": "...", "sources": [...]}
     """
-    retriever = get_retriever(vectorstore)
-
     # ── CHANGED: api_key passed directly ─────────────────────────────────────
     # BEFORE: ChatGroq(model=...) → read key from os.environ["GROQ_API_KEY"]
     # AFTER:  ChatGroq(model=..., api_key=api_key) → key passed from UI input
@@ -154,7 +147,7 @@ def build_rag_chain(vectorstore: FAISS, api_key: str):
     #   When the browser session ends, it's gone.
     # ─────────────────────────────────────────────────────────────────────────
     llm = ChatGroq(
-        model="llama-3.3-70b-versatile",
+        model="openai/gpt-oss-120b",
         temperature=0,
         api_key=api_key                 # ← key from user's UI input
     )

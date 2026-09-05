@@ -14,3 +14,6 @@ sentence-transformers
 
 # Vector store
 faiss-cpu
+
+# BM25 retriever (hybrid ensemble — keyword search)
+rank-bm25
