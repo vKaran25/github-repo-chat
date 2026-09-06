@@ -1,5 +1,6 @@
 gitingest
 streamlit
+requests
 
 # LangChain
 langchain

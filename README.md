@@ -17,16 +17,19 @@ The system reads the **actual code** — not a model's memory of it. Every answe
 
 ---
 
-## Features
+### Features
 
-**Retrieval-Augmented Generation (RAG)**
-Fetches the entire repo, splits it into chunks, embeds them into a vector store, and retrieves only the most relevant chunks per question — so the LLM answers from real code, not guesswork.
+**Hybrid Retrieval-Augmented Generation (RAG)**
+Combines BM25 keyword search with FAISS dense semantic embeddings using LangChain's `EnsembleRetriever` (weighted 0.4 BM25 / 0.6 FAISS). Excels at both exact identifier lookup (function names, variables, configs) and high-level conceptual questions.
+
+**Dynamic Model Selection & Live Key Validation**
+Paste your Groq API key and the app instantly validates it, fetching active chat models available to your account into a clean sidebar dropdown. Switch models seamlessly mid-session without losing chat history.
 
 **Source Citations**
 Every repo-specific answer shows which files the information came from, in a collapsible expander below the response.
 
 **Conversation Memory**
-Follow-up questions work naturally. Ask *"how does auth work?"* then *"where exactly is that implemented?"* — the system knows what *"that"* refers to.
+Follow-up questions work naturally. Ask *"how does auth work?"* then *"where exactly is that implemented?"* — the system knows what *"that"* refers to. Includes a dedicated "Clear History" control.
 
 **Smart Prompt Routing**
 Handles three question types in one chain — repo-specific questions use retrieved context, general programming concepts use the LLM's own knowledge, hybrid questions combine both.
@@ -44,15 +47,17 @@ Users provide their own free Groq API key — no shared credentials, no usage li
 | Layer | Tool | Why |
 |---|---|---|
 | Repo ingestion | GitIngest | Converts any GitHub repo to structured text |
-| File filtering | Custom parser | Removes junk before embedding (state machine) |
+| File filtering | Custom parser (`filter.py`) | Removes junk before embedding (state machine) |
 | Chunking | `RecursiveCharacterTextSplitter` | Respects code boundaries |
 | Embeddings | HuggingFace `all-MiniLM-L6-v2` | In-process inference — no HTTP, no server |
-| Vector store | FAISS | In-memory, sub-5ms similarity search |
-| LLM | Groq `llama-3.3-70b-versatile` | Fastest inference available, free tier |
+| Dense retrieval | FAISS | In-memory, sub-5ms vector similarity search |
+| Sparse retrieval | `BM25Retriever` (`rank-bm25`) | In-memory exact keyword & identifier matching |
+| Hybrid fusion | `EnsembleRetriever` | Merges dense + sparse ranks via Reciprocal Rank Fusion |
+| LLM | Groq (`get_llm()` factory) | Fast inference, dynamic model selection from live API key |
 | Memory | `RunnableWithMessageHistory` | Per-session conversation history |
 | Orchestration | LangChain LCEL | Composable pipeline with `\|` pipes |
 | Parallel execution | `RunnableParallel` | Answer + sources run simultaneously |
-| UI | Streamlit | Chat interface with session state |
+| UI | Streamlit | Chat interface with dynamic sidebar controls |
 
 ---
 
@@ -62,19 +67,24 @@ Users provide their own free Groq API key — no shared credentials, no usage li
 GitHub URL
     ↓ GitIngest
 Raw repo text (tree + all files)
-    ↓ filters.py — strips node_modules, lock files, binaries
+    ↓ filter.py — strips node_modules, lock files, binaries
 Clean text
     ↓ RecursiveCharacterTextSplitter (1500 chars, 200 overlap)
 Chunks
-    ↓ HuggingFaceEmbeddings — all-MiniLM-L6-v2 (in-process)
-Vectors
-    ↓ FAISS index (in-memory)
+    ├──→ BM25Retriever (k=5, exact keywords)
+    └──→ HuggingFaceEmbeddings → FAISS index (k=5, semantic vectors)
+            ↓
+    EnsembleRetriever (weights: [0.4 BM25, 0.6 FAISS], RRF fusion)
+
+User enters Groq API Key
+    ↓ GET https://api.groq.com/openai/v1/models (validates key & filters chat models)
+    ↓ Populates dynamic model selectbox (rebuilds chain without re-indexing)
 
 User asks a question
     ↓ RunnableWithMessageHistory injects conversation history
     ↓ RunnableParallel branches:
-        ├── question → retriever (top-5 chunks) → prompt → Groq LLM → answer
-        └── question → retriever → extract metadata → source filenames
+        ├── question → hybrid retriever → prompt → Groq LLM (selected model) → answer
+        └── question → hybrid retriever → extract metadata → source filenames
     ↓ Control token [USED_CONTEXT] decides whether to show sources
     ↓ Streamlit renders answer + collapsible citations
 ```
@@ -83,14 +93,17 @@ User asks a question
 
 ## Engineering Decisions
 
+**Why Hybrid Search (EnsembleRetriever)?**
+Vector search alone often struggles with exact symbols like variable names, error codes, and config keys. BM25 catches exact keyword matches, while FAISS catches conceptual logic. Combining both with Reciprocal Rank Fusion delivers superior code search accuracy.
+
 **Why FAISS over Chroma?**
 In-memory search is sub-5ms at this scale. No server to manage, no persistence overhead. Right tool for the job.
 
 **Why HuggingFace over Ollama embeddings?**
 HuggingFace loads the model directly into the Python process — no HTTP round trips even to localhost. Embedding time dropped from 3-5 minutes to 20-30 seconds.
 
-**Why Groq over OpenAI?**
-Groq's LPU hardware delivers 500-800 tokens/second — faster than any GPU-based inference. Free tier runs a 70B parameter model faster than a local 8B model.
+**Why Dynamic Model Loading via `get_llm()` Factory?**
+Users get access to their latest authorized Groq models (e.g., `openai/gpt-oss-120b`, `llama-3.3-70b-versatile`) without code changes. Decoupling model creation into `get_llm()` also makes migrating to agentic frameworks like LangGraph straightforward.
 
 **Why `RunnableParallel` for citations?**
 Running answer and source extraction in parallel means one retriever call serves both. Avoids redundant vector searches.
@@ -114,7 +127,7 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-Get a free Groq API key at [console.groq.com](https://console.groq.com), enter it in the sidebar, paste a repo URL, and start asking questions.
+Get a free Groq API key at [console.groq.com](https://console.groq.com), paste it in the sidebar (models populate automatically), enter a repo URL, and start exploring.
 
 ---
 
@@ -122,10 +135,10 @@ Get a free Groq API key at [console.groq.com](https://console.groq.com), enter i
 
 ```
 github-rag/
-├── app.py           → Streamlit UI, session state, control token parsing
-├── chain.py         → LCEL pipeline, memory storage, RAG chain
-├── ingest.py        → Fetch → filter → split → embed → FAISS
-├── filters.py       → Junk file detection (state machine parser)
+├── app.py           → Streamlit UI, dynamic model picker, control token parsing
+├── chain.py         → LCEL pipeline, get_llm factory, memory storage, RAG chain
+├── ingest.py        → Fetch → filter → split → BM25 + FAISS EnsembleRetriever
+├── filter.py        → Junk file detection (state machine parser)
 └── requirements.txt
 ```
 
@@ -135,6 +148,7 @@ github-rag/
 
 Built this to get hands-on with production RAG patterns — not just "it works" but understanding why each architectural decision exists. Key takeaways:
 
+- Hybrid search combining BM25 + dense vectors significantly outperforms pure vector search on codebases
 - LangChain's abstraction layer (LCEL) makes swapping components trivial — changing from Ollama to Groq was 2 lines
 - Embedding is the real bottleneck in RAG pipelines, not retrieval or generation
 - Prompt engineering matters more than model choice for output quality
@@ -145,6 +159,7 @@ Built this to get hands-on with production RAG patterns — not just "it works" 
 ## Roadmap
 
 - [ ] Streaming UI responses
+- [ ] Migration to LangGraph stateful multi-step agent
 - [ ] Repo comparison mode — ask questions across two repos simultaneously  
 - [ ] Evaluation script — LLM-as-a-judge scoring pipeline
 - [ ] Code-aware chunking — split at function/class boundaries

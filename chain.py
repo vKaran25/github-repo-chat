@@ -17,8 +17,9 @@
 #   - Memory wrapping (RunnableWithMessageHistory)
 #
 # WHAT app.py IMPORTS FROM HERE:
-#   build_rag_chain(retriever, api_key) → builds the full chain with memory
-#   reset_memory()                      → called when user indexes a new repo
+#   build_rag_chain(retriever, api_key, model_id) → builds the full chain with memory
+#   get_llm(model_id, api_key)                    → standalone LLM factory
+#   reset_memory()                                → called when user indexes a new repo
 # =============================================================================
 
 from langchain_groq import ChatGroq
@@ -123,34 +124,34 @@ def extract_sources(docs: list) -> list[str]:
 # SECTION 3 — BUILD CHAIN WITH MEMORY
 # =============================================================================
 
-def build_rag_chain(retriever, api_key: str):
+def get_llm(model_id: str, api_key: str) -> ChatGroq:
+    """
+    Factory — single place to instantiate the Groq LLM.
+    model_id is chosen live from the sidebar dropdown (fetched from Groq's
+    /models endpoint). Centralised here so LangGraph node functions can
+    call get_llm() directly when the pipeline migrates to LangGraph,
+    without needing to touch the graph structure.
+    """
+    return ChatGroq(
+        model=model_id,
+        temperature=0,
+        api_key=api_key
+    )
+
+
+def build_rag_chain(retriever, api_key: str, model_id: str):
     """
     Builds and returns the full RAG chain with memory.
 
     WHAT CHANGED:
-      - Accepts a pre-built retriever (EnsembleRetriever from ingest.py)
-        instead of a raw FAISS vectorstore.
-      - get_retriever() is gone — retriever construction now lives in
-        ingest.py's build_hybrid_retriever().
-      - api_key is still passed directly from the UI. No .env needed.
+      - Accepts model_id from the sidebar live dropdown.
+      - LLM instantiation delegated to get_llm() factory.
+      - Retriever is an EnsembleRetriever (BM25 + FAISS hybrid) from ingest.py.
+      - api_key passed directly from the UI — no .env needed.
 
     Returns: {"answer": "...", "sources": [...]}
     """
-    # ── CHANGED: api_key passed directly ─────────────────────────────────────
-    # BEFORE: ChatGroq(model=...) → read key from os.environ["GROQ_API_KEY"]
-    # AFTER:  ChatGroq(model=..., api_key=api_key) → key passed from UI input
-    #
-    # WHY this is safe:
-    #   The key lives in st.session_state in app.py (browser session memory).
-    #   It's passed here at chain-build time and used by ChatGroq for API calls.
-    #   It's never written to disk, never logged, never stored server-side.
-    #   When the browser session ends, it's gone.
-    # ─────────────────────────────────────────────────────────────────────────
-    llm = ChatGroq(
-        model="openai/gpt-oss-120b",
-        temperature=0,
-        api_key=api_key                 # ← key from user's UI input
-    )
+    llm = get_llm(model_id, api_key)
 
     extract_question = RunnableLambda(lambda x: x["question"])
 
