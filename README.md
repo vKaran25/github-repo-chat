@@ -22,11 +22,14 @@ The system reads the **actual code** — not a model's memory of it. Every answe
 **Hybrid Retrieval-Augmented Generation (RAG)**
 Combines BM25 keyword search with FAISS dense semantic embeddings using LangChain's `EnsembleRetriever` (weighted 0.4 BM25 / 0.6 FAISS). Excels at both exact identifier lookup (function names, variables, configs) and high-level conceptual questions.
 
+**Language-Aware Per-File Chunking**
+Parses the repository into individual file documents and applies language-specialized splitters (`Language.PYTHON`, `Language.JS`, `Language.TS`, `Language.GO`, `Language.JAVA`, `Language.RUST`, `Language.CPP`, `Language.MARKDOWN`, etc.). Respects class, function, and block boundaries rather than slicing arbitrary characters, with safe generic fallbacks for config files and text.
+
+**Precise Source Citations**
+Every code chunk preserves its originating file path (`src/auth/jwt.py`, `handlers/api.go`, etc.). When an answer is grounded in repo context, the collapsible expander cites the exact files used instead of a generic repository URL.
+
 **Dynamic Model Selection & Live Key Validation**
 Paste your Groq API key and the app instantly validates it, fetching active chat models available to your account into a clean sidebar dropdown. Switch models seamlessly mid-session without losing chat history.
-
-**Source Citations**
-Every repo-specific answer shows which files the information came from, in a collapsible expander below the response.
 
 **Conversation Memory**
 Follow-up questions work naturally. Ask *"how does auth work?"* then *"where exactly is that implemented?"* — the system knows what *"that"* refers to. Includes a dedicated "Clear History" control.
@@ -48,7 +51,7 @@ Users provide their own free Groq API key — no shared credentials, no usage li
 |---|---|---|
 | Repo ingestion | GitIngest | Converts any GitHub repo to structured text |
 | File filtering | Custom parser (`filter.py`) | Removes junk before embedding (state machine) |
-| Chunking | `RecursiveCharacterTextSplitter` | Respects code boundaries |
+| Chunking | `RecursiveCharacterTextSplitter.from_language` | Language-aware code splitting per file (Python, JS/TS, Go, Rust, Java, etc.) |
 | Embeddings | HuggingFace `all-MiniLM-L6-v2` | In-process inference — no HTTP, no server |
 | Dense retrieval | FAISS | In-memory, sub-5ms vector similarity search |
 | Sparse retrieval | `BM25Retriever` (`rank-bm25`) | In-memory exact keyword & identifier matching |
@@ -69,8 +72,10 @@ GitHub URL
 Raw repo text (tree + all files)
     ↓ filter.py — strips node_modules, lock files, binaries
 Clean text
-    ↓ RecursiveCharacterTextSplitter (1500 chars, 200 overlap)
-Chunks
+    ↓ parse_into_file_documents() — separates into Documents with actual filepaths
+Per-file Documents
+    ↓ split_documents() — Language-aware splitting via from_language()
+Code Chunks (each preserving metadata={"source": filepath})
     ├──→ BM25Retriever (k=5, exact keywords)
     └──→ HuggingFaceEmbeddings → FAISS index (k=5, semantic vectors)
             ↓
@@ -84,7 +89,7 @@ User asks a question
     ↓ RunnableWithMessageHistory injects conversation history
     ↓ RunnableParallel branches:
         ├── question → hybrid retriever → prompt → Groq LLM (selected model) → answer
-        └── question → hybrid retriever → extract metadata → source filenames
+        └── question → hybrid retriever → extract metadata → exact source filepaths
     ↓ Control token [USED_CONTEXT] decides whether to show sources
     ↓ Streamlit renders answer + collapsible citations
 ```
@@ -92,6 +97,9 @@ User asks a question
 ---
 
 ## Engineering Decisions
+
+**Why Language-Aware Per-File Chunking?**
+Treating an entire codebase as a single continuous text string causes chunks to awkwardly span across file boundaries and chops functions or classes in half at arbitrary character counts. Parsing into individual file Documents and applying `RecursiveCharacterTextSplitter.from_language()` ensures chunks respect syntactic boundaries (`def`, `class`, `func`, `export`). It also guarantees each chunk retains its exact file path in metadata, enabling accurate source citations in the UI.
 
 **Why Hybrid Search (EnsembleRetriever)?**
 Vector search alone often struggles with exact symbols like variable names, error codes, and config keys. BM25 catches exact keyword matches, while FAISS catches conceptual logic. Combining both with Reciprocal Rank Fusion delivers superior code search accuracy.
@@ -137,7 +145,7 @@ Get a free Groq API key at [console.groq.com](https://console.groq.com), paste i
 github-rag/
 ├── app.py           → Streamlit UI, dynamic model picker, control token parsing
 ├── chain.py         → LCEL pipeline, get_llm factory, memory storage, RAG chain
-├── ingest.py        → Fetch → filter → split → BM25 + FAISS EnsembleRetriever
+├── ingest.py        → Fetch → filter → per-file language split → BM25 + FAISS EnsembleRetriever
 ├── filter.py        → Junk file detection (state machine parser)
 └── requirements.txt
 ```
@@ -148,6 +156,7 @@ github-rag/
 
 Built this to get hands-on with production RAG patterns — not just "it works" but understanding why each architectural decision exists. Key takeaways:
 
+- Language-aware chunking per file prevents cross-file bleed and preserves semantic function/class units
 - Hybrid search combining BM25 + dense vectors significantly outperforms pure vector search on codebases
 - LangChain's abstraction layer (LCEL) makes swapping components trivial — changing from Ollama to Groq was 2 lines
 - Embedding is the real bottleneck in RAG pipelines, not retrieval or generation
@@ -162,4 +171,4 @@ Built this to get hands-on with production RAG patterns — not just "it works" 
 - [ ] Migration to LangGraph stateful multi-step agent
 - [ ] Repo comparison mode — ask questions across two repos simultaneously  
 - [ ] Evaluation script — LLM-as-a-judge scoring pipeline
-- [ ] Code-aware chunking — split at function/class boundaries
+- [x] Code-aware chunking — split at function/class boundaries
