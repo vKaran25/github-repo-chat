@@ -21,9 +21,10 @@ import asyncio
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
+import os
 from gitingest import ingest
 from langchain_core.documents import Document
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_text_splitters import RecursiveCharacterTextSplitter, Language
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_community.retrievers import BM25Retriever
@@ -38,13 +39,86 @@ from filter import filter_content       # ← strips node_modules, lock files, b
 
 
 # =============================================================================
+# LANGUAGE DETECTION — extension → Language enum for code-aware splitting
+# =============================================================================
+#
+# RecursiveCharacterTextSplitter.from_language() uses language-specific
+# separator sequences so splits respect code structure boundaries:
+#   Python  → splits on "class ", "def ", "\n\n", "\n", " "
+#   JS/TS   → splits on "function ", "class ", "\n\n", "\n", " "
+#   Go      → splits on "func ", "type ", "\n\n", "\n", " "
+#   Markdown→ splits on headings (#), "---", "\n\n", "\n", " "
+#
+# Files with extensions not in this map fall back to the generic splitter —
+# same behaviour as before this change (YAML, JSON, Dockerfile, .env, etc.)
+# Language.C is intentionally excluded — known to be buggy in some LangChain builds.
+# =============================================================================
+
+EXTENSION_TO_LANGUAGE: dict[str, Language] = {
+    ".py":    Language.PYTHON,
+    ".js":    Language.JS,
+    ".jsx":   Language.JS,
+    ".ts":    Language.TS,
+    ".tsx":   Language.TS,
+    ".java":  Language.JAVA,
+    ".go":    Language.GO,
+    ".rs":    Language.RUST,
+    ".rb":    Language.RUBY,
+    ".php":   Language.PHP,
+    ".cpp":   Language.CPP,
+    ".cc":    Language.CPP,
+    ".cxx":   Language.CPP,
+    ".hpp":   Language.CPP,
+    ".cs":    Language.CSHARP,
+    ".kt":    Language.KOTLIN,
+    ".scala": Language.SCALA,
+    ".swift": Language.SWIFT,
+    ".md":    Language.MARKDOWN,
+    ".rst":   Language.RST,
+    ".html":  Language.HTML,
+    ".htm":   Language.HTML,
+    ".proto": Language.PROTO,
+}
+
+
+def get_splitter_for_file(filepath: str) -> RecursiveCharacterTextSplitter:
+    """
+    Returns a RecursiveCharacterTextSplitter appropriate for the file's language.
+    - Known code extensions  → language-aware splitter via from_language()
+    - Everything else        → generic splitter (same as the old split_documents)
+    The try/except catches any broken Language.* implementations silently.
+    """
+    ext = os.path.splitext(filepath)[-1].lower()
+    lang = EXTENSION_TO_LANGUAGE.get(ext)
+    if lang is not None:
+        try:
+            return RecursiveCharacterTextSplitter.from_language(
+                language=lang,
+                chunk_size=1500,
+                chunk_overlap=200,
+            )
+        except Exception:
+            pass    # broken Language.* implementation — fall through
+    # Generic fallback for YAML, JSON, plain text, Dockerfile, unknown extensions
+    return RecursiveCharacterTextSplitter(
+        chunk_size=1500,
+        chunk_overlap=200,
+        length_function=len,
+    )
+
+
+# =============================================================================
 # STEP 1 — Fetch repo, filter junk, wrap in Document
 # =============================================================================
 
 def load_repo_as_document(github_url: str) -> list[Document]:
     """
     Fetches a GitHub repo via GitIngest, filters junk files out,
-    and wraps the clean content in a LangChain Document.
+    and parses the output into one Document per file.
+
+    Returns a list of Documents — one per file — each with
+    metadata={"source": filepath} so language-aware splitting
+    and accurate file-path citations work downstream.
 
     GitIngest returns three things:
       summary → repo stats (ignored)
@@ -60,44 +134,108 @@ def load_repo_as_document(github_url: str) -> list[Document]:
     # Combine file structure + code into one text block
     full_text = f"REPOSITORY STRUCTURE:\n{tree}\n\nREPOSITORY CONTENT:\n{content}"
 
-    # ── Filter before doing anything else ────────────────────────────────────
-    # filter_content() lives in filters.py.
-    # It strips out node_modules, lock files, images, binaries, build output.
-    # Everything downstream (splitting, embedding, FAISS) gets cleaner input.
-    # ingest.py doesn't know HOW filtering works — just calls it and moves on.
-    # This is the Single Responsibility Principle — each file has one job.
-    # ─────────────────────────────────────────────────────────────────────────
+    # Filter junk files out (node_modules, lock files, images, binaries, build output)
     filtered_text = filter_content(full_text)
 
-    print(f"📄 Repo ready — {len(filtered_text):,} chars after filtering")
+    # Parse into one Document per file — each gets metadata={"source": filepath}
+    docs = parse_into_file_documents(filtered_text)
+    print(f"📄 Parsed {len(docs)} file(s) from repo")
 
-    doc = Document(
-        page_content=filtered_text,
-        metadata={"source": github_url}
-    )
+    return docs
 
-    return [doc]
+
+def parse_into_file_documents(filtered_text: str) -> list[Document]:
+    """
+    Parses GitIngest's filtered content string into one Document per file.
+
+    Uses the same separator-detection logic as filter.py:
+        ================================================
+        File: path/to/file.ext
+        ================================================
+        ...file contents...
+
+    Each resulting Document gets metadata={"source": filepath} — the actual
+    file path, not the repo URL. This is what makes per-file citations work.
+
+    Content appearing before the first "File:" header (the repo tree/structure
+    section) becomes a Document with metadata={"source": "REPOSITORY_STRUCTURE"}.
+    """
+    lines = filtered_text.splitlines()
+    docs = []
+    current_source = "REPOSITORY_STRUCTURE"
+    current_lines: list[str] = []
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        is_separator = line.strip().startswith("=") and len(line.strip()) > 10
+
+        # Detect file header: separator → "File: path" → separator
+        if (is_separator
+                and i + 1 < len(lines)
+                and lines[i + 1].startswith("File:")):
+            # Flush accumulated content as a Document for the previous file
+            content = "\n".join(current_lines).strip()
+            if content:
+                docs.append(Document(
+                    page_content=content,
+                    metadata={"source": current_source}
+                ))
+            # Start the new file
+            current_source = lines[i + 1].replace("File:", "").strip()
+            current_lines = []
+            # Skip the three header lines: separator, "File: ...", closing separator
+            i += 3
+            continue
+
+        current_lines.append(line)
+        i += 1
+
+    # Flush the final file's content
+    content = "\n".join(current_lines).strip()
+    if content:
+        docs.append(Document(
+            page_content=content,
+            metadata={"source": current_source}
+        ))
+
+    return docs
 
 
 # =============================================================================
-# STEP 2 — Split into chunks
+# STEP 2 — Split into chunks (language-aware, per file)
 # =============================================================================
 #
-# RecursiveCharacterTextSplitter splits on natural boundaries:
-#   "\n\n" → "\n" → " " → "" (in order of preference)
+# Each file Document is split with a language-appropriate splitter:
+#   .py  → Language.PYTHON separators (class/def boundaries)
+#   .go  → Language.GO separators (func/type boundaries)
+#   .js  → Language.JS separators (function/class boundaries)
+#   ...anything else → generic splitter (same as before this change)
+#
+# Splitting per-file ensures:
+#   1. Chunks never span across two different files
+#   2. The file's metadata={"source": filepath} is copied to every chunk
+#      automatically by LangChain's split_documents() — no extra work needed
+#   3. Code blocks (functions, classes) stay intact where possible
+#
 # chunk_size=1500    → max characters per chunk
 # chunk_overlap=200  → repeated chars between chunks (prevents boundary cutoffs)
 # =============================================================================
 
-def split_documents(documents: list[Document]) -> list[Document]:
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1500,
-        chunk_overlap=200,
-        length_function=len,
-    )
-    chunks = splitter.split_documents(documents)
-    print(f"✂️  Split into {len(chunks)} chunks")
-    return chunks
+def split_documents(file_docs: list[Document]) -> list[Document]:
+    """
+    Splits each file Document using a language-appropriate splitter.
+    LangChain's split_documents() automatically propagates source metadata
+    to every chunk — the file-path citation feature works with zero extra code.
+    """
+    all_chunks: list[Document] = []
+    for doc in file_docs:
+        filepath = doc.metadata.get("source", "")
+        splitter = get_splitter_for_file(filepath)
+        chunks = splitter.split_documents([doc])
+        all_chunks.extend(chunks)
+    print(f"✂️  Split into {len(all_chunks)} chunks across {len(file_docs)} file(s)")
+    return all_chunks
 
 
 # =============================================================================
