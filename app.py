@@ -109,14 +109,9 @@ def fetch_groq_models(api_key: str) -> list[str]:
 # used_context=True  → show sources expander
 # used_context=False → hide sources expander
 def parse_answer(raw_answer: str) -> tuple[str, bool]:
-    lines = raw_answer.strip().splitlines()
-    for i in range(len(lines) - 1, -1, -1):
-        if lines[i].strip():
-            if lines[i].strip() == "[USED_CONTEXT]":
-                clean_lines = lines[:i] + lines[i+1:]
-                return "\n".join(clean_lines).strip(), True
-            else:
-                return raw_answer.strip(), False
+    if "[USED_CONTEXT]" in raw_answer:
+        clean_answer = raw_answer.replace("[USED_CONTEXT]", "").strip()
+        return clean_answer, True
     return raw_answer.strip(), False
 
 

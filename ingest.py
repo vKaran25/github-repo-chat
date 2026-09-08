@@ -11,18 +11,9 @@
 #   filters.py → filter_content()   strips junk files before splitting
 # =============================================================================
 
-import sys
-import asyncio
-
-# Windows fix — default SelectorEventLoop doesn't support subprocesses.
-# GitIngest uses asyncio subprocesses internally to run git commands.
-# ProactorEventLoop supports this. Guard with sys.platform so it only
-# applies on Windows and doesn't affect Mac/Linux users.
-if sys.platform == "win32":
-    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-
 import os
-from gitingest import ingest
+import concurrent.futures
+from gitingest import ingest as _ingest_sync
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter, Language
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -120,16 +111,20 @@ def load_repo_as_document(github_url: str) -> list[Document]:
     metadata={"source": filepath} so language-aware splitting
     and accurate file-path citations work downstream.
 
-    GitIngest returns three things:
-      summary → repo stats (ignored)
-      tree    → folder/file structure as a string
-      content → all code and text files concatenated
-
-    We combine tree + content so the LLM also knows the file structure
-    when answering questions like "where is the auth logic?"
+    WHY ThreadPoolExecutor?
+      gitingest.ingest() calls asyncio.run() internally.
+      Streamlit 1.x runs user script code inside its own asyncio event loop.
+      asyncio.run() cannot be called from a running event loop — it raises
+      RuntimeError. Running ingest() in a ThreadPoolExecutor worker thread
+      sidesteps this: worker threads have NO event loop, so asyncio.run()
+      inside gitingest works perfectly. Confirmed by diagnostic test.
     """
     print(f"📥 Fetching repo: {github_url}")
-    summary, tree, content = ingest(github_url)
+
+    # Run gitingest in a fresh thread — no asyncio event loop conflict
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(_ingest_sync, github_url)
+        summary, tree, content = future.result()
 
     # Combine file structure + code into one text block
     full_text = f"REPOSITORY STRUCTURE:\n{tree}\n\nREPOSITORY CONTENT:\n{content}"
@@ -170,10 +165,9 @@ def parse_into_file_documents(filtered_text: str) -> list[Document]:
         line = lines[i]
         is_separator = line.strip().startswith("=") and len(line.strip()) > 10
 
-        # Detect file header: separator → "File: path" → separator
-        if (is_separator
-                and i + 1 < len(lines)
-                and lines[i + 1].startswith("File:")):
+        # Detect file header: separator → ("FILE: path" or "File: path")
+        next_line = lines[i + 1].strip() if i + 1 < len(lines) else ""
+        if is_separator and next_line.lower().startswith("file:"):
             # Flush accumulated content as a Document for the previous file
             content = "\n".join(current_lines).strip()
             if content:
@@ -181,10 +175,10 @@ def parse_into_file_documents(filtered_text: str) -> list[Document]:
                     page_content=content,
                     metadata={"source": current_source}
                 ))
-            # Start the new file
-            current_source = lines[i + 1].replace("File:", "").strip()
+            # Start the new file (extract path after "FILE:" or "File:")
+            current_source = next_line.split(":", 1)[1].strip()
             current_lines = []
-            # Skip the three header lines: separator, "File: ...", closing separator
+            # Skip the three header lines: separator, "FILE: ...", closing separator
             i += 3
             continue
 
@@ -286,15 +280,33 @@ def build_vectorstore(chunks: list[Document]) -> FAISS:
 # =============================================================================
 
 def build_hybrid_retriever(chunks: list[Document]) -> EnsembleRetriever:
+    # ── Drop REPOSITORY_STRUCTURE chunks before indexing ─────────────────────
+    # The directory tree listing (file structure overview) is stored with
+    # source="REPOSITORY_STRUCTURE". It contains every filename and directory
+    # name in the repo. If indexed in BM25, it scores highly for almost any
+    # query (any keyword the user types is likely a filename in the tree),
+    # polluting retrieval results and making citations always show
+    # "REPOSITORY_STRUCTURE" instead of actual file paths.
+    # We keep only chunks that have a real file path as their source.
+    # ─────────────────────────────────────────────────────────────────────────
+    indexable_chunks = [
+        c for c in chunks
+        if c.metadata.get("source") != "REPOSITORY_STRUCTURE"
+    ]
+    # Defensive safeguard: if no non-tree chunks exist, fallback to all chunks so BM25 never receives []
+    if not indexable_chunks:
+        indexable_chunks = chunks
+    print(f"📦 Indexing {len(indexable_chunks)} chunks (tree chunks excluded)")
+
     # ── BM25: keyword search ──────────────────────────────────────────────────
     # from_documents() tokenises each chunk's page_content and builds an
     # in-memory BM25 index. No model download, no HTTP — pure Python.
-    bm25_retriever = BM25Retriever.from_documents(chunks)
+    bm25_retriever = BM25Retriever.from_documents(indexable_chunks)
     bm25_retriever.k = 5
 
     # ── FAISS: dense semantic search ──────────────────────────────────────────
     # Same vectorstore build as before, then wrapped as a retriever.
-    vectorstore = build_vectorstore(chunks)
+    vectorstore = build_vectorstore(indexable_chunks)
     faiss_retriever = vectorstore.as_retriever(
         search_type="similarity",
         search_kwargs={"k": 5}

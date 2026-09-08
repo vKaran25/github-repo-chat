@@ -228,11 +228,12 @@ def filter_content(raw_content: str) -> str:
         # We check this first, then look ahead to see if next line is "File: ..."
         # ─────────────────────────────────────────────────────────────────────
         is_separator = line.strip().startswith("=") and len(line.strip()) > 10
+        next_line = lines[i + 1].strip() if i + 1 < len(lines) else ""
 
-        if is_separator and i + 1 < len(lines) and lines[i + 1].startswith("File:"):
+        if is_separator and next_line.lower().startswith("file:"):
             # We found a file header block — extract the filepath
-            # "File: src/auth/utils.py" → "src/auth/utils.py"
-            filepath = lines[i + 1].replace("File:", "").strip()
+            # Handles both "FILE: path" and "File: path"
+            filepath = next_line.split(":", 1)[1].strip()
             current_file = filepath
 
             # Ask _should_skip_file() whether to filter this file
