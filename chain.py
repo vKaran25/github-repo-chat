@@ -114,6 +114,9 @@ def extract_sources(docs: list) -> list[str]:
     sources = []
     for doc in docs:
         source = doc.metadata.get("source", "Unknown source")
+        # Skip the tree/structure overview — it's not a real file citation
+        if source == "REPOSITORY_STRUCTURE":
+            continue
         if source not in seen:
             seen.add(source)
             sources.append(source)
@@ -172,15 +175,33 @@ def build_rag_chain(retriever, api_key: str, model_id: str):
 
     sources_chain = extract_question | retriever | extract_sources
 
-    parallel_chain = RunnableParallel(
-        answer=answer_chain,
-        sources=sources_chain
-    )
-
-    return RunnableWithMessageHistory(
-        parallel_chain,
+    # ── THE FIX ───────────────────────────────────────────────────────────────
+    # BEFORE (broken):
+    #   RunnableWithMessageHistory(
+    #       RunnableParallel(answer=..., sources=...),  ← wraps BOTH
+    #       output_messages_key="answer"                ← silently drops "sources"
+    #   )
+    #
+    # AFTER (fixed):
+    #   RunnableParallel(
+    #       answer = RunnableWithMessageHistory(answer_chain),  ← only answer has history
+    #       sources = sources_chain                             ← passes through untouched
+    #   )
+    #
+    # When output_messages_key is set and the inner chain produces a dict, LangChain
+    # only passes through the key matching output_messages_key — "sources" was silently
+    # thrown away. Wrapping only answer_chain (which returns a plain string) fixes this.
+    # ─────────────────────────────────────────────────────────────────────────
+    answer_with_history = RunnableWithMessageHistory(
+        answer_chain,
         get_session_history,
         input_messages_key="question",
         history_messages_key="history",
-        output_messages_key="answer"
+        # No output_messages_key needed — answer_chain returns a plain string,
+        # not a dict, so RunnableWithMessageHistory saves it directly as an AI message.
+    )
+
+    return RunnableParallel(
+        answer=answer_with_history,
+        sources=sources_chain
     )
