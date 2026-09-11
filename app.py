@@ -115,6 +115,32 @@ def parse_answer(raw_answer: str) -> tuple[str, bool]:
     return raw_answer.strip(), False
 
 
+def stream_parser(stream_iterable, result_container):
+    """
+    Consumes the LangChain stream, catching the `[USED_CONTEXT]` token in a 
+    rolling buffer so it never flashes on the Streamlit UI.
+    Populates result_container["sources"] and result_container["used_context"].
+    """
+    buffer = ""
+    for chunk in stream_iterable:
+        if "sources" in chunk:
+            result_container["sources"] = chunk["sources"]
+        
+        if "answer" in chunk:
+            buffer += chunk["answer"]
+            if len(buffer) > 30:
+                yield buffer[:-30]
+                buffer = buffer[-30:]
+                
+    if "[USED_CONTEXT]" in buffer:
+        buffer = buffer.replace("[USED_CONTEXT]", "")
+        result_container["used_context"] = True
+    else:
+        result_container["used_context"] = False
+
+    yield buffer.strip()
+
+
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("Setup")
@@ -249,38 +275,43 @@ if prompt := st.chat_input("Ask about the repository..."):
             st.write(prompt)
 
         with st.chat_message("assistant"):
-            with st.spinner("Thinking..."):
-                try:
-                    result = st.session_state.chain.invoke(
-                        {"question": prompt},
-                        config=MEMORY_CONFIG
+            try:
+                # Container to catch metadata extracted during the stream
+                result_container = {"sources": [], "used_context": False}
+                
+                stream = st.session_state.chain.stream(
+                    {"question": prompt},
+                    config=MEMORY_CONFIG
+                )
+                
+                # Render the streaming response chunk-by-chunk
+                clean_answer = st.write_stream(stream_parser(stream, result_container))
+
+                used_context = result_container["used_context"]
+                sources = result_container["sources"]
+
+                if used_context and sources:
+                    with st.expander("📁 Sources used"):
+                        for src in sources:
+                            st.markdown(f"- `{src}`")
+
+                msg_to_save = {"role": "assistant", "content": clean_answer}
+                if used_context and sources:
+                    msg_to_save["sources"] = sources
+                st.session_state.messages.append(msg_to_save)
+
+            except Exception as e:
+                err_str = str(e).lower()
+                # Detect context-window overflow — can happen after model switch
+                # if the new model has a smaller context limit than the history
+                if any(x in err_str for x in [
+                    "context_length", "context length",
+                    "maximum context", "context window",
+                    "too long", "token limit", "exceeded"
+                ]):
+                    st.warning(
+                        "⚠️ Your conversation history is too long for this model. "
+                        "Click **🗑️ Clear History** in the sidebar to continue."
                     )
-
-                    clean_answer, used_context = parse_answer(result["answer"])
-                    st.write(clean_answer)
-
-                    if used_context and result["sources"]:
-                        with st.expander("📁 Sources used"):
-                            for src in result["sources"]:
-                                st.markdown(f"- `{src}`")
-
-                    msg_to_save = {"role": "assistant", "content": clean_answer}
-                    if used_context and result["sources"]:
-                        msg_to_save["sources"] = result["sources"]
-                    st.session_state.messages.append(msg_to_save)
-
-                except Exception as e:
-                    err_str = str(e).lower()
-                    # Detect context-window overflow — can happen after model switch
-                    # if the new model has a smaller context limit than the history
-                    if any(x in err_str for x in [
-                        "context_length", "context length",
-                        "maximum context", "context window",
-                        "too long", "token limit", "exceeded"
-                    ]):
-                        st.warning(
-                            "⚠️ Your conversation history is too long for this model. "
-                            "Click **🗑️ Clear History** in the sidebar to continue."
-                        )
-                    else:
-                        st.error(f"Error: {type(e).__name__}: {e}")
+                else:
+                    st.error(f"Error: {type(e).__name__}: {e}")
