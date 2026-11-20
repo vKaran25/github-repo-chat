@@ -17,6 +17,8 @@
 #   chain.py  → build_rag_chain(vectorstore, api_key), reset_memory()
 # =============================================================================
 
+import uuid
+
 import requests
 import streamlit as st
 from ingest import ingest_github_repo
@@ -49,7 +51,13 @@ if "last_fetched_key" not in st.session_state:
     st.session_state.last_fetched_key = ""       # key we last fetched models for
 
 # ── Memory config ─────────────────────────────────────────────────────────────
-SESSION_ID = "default"
+# chain.py keeps chat history in one module-level dict shared by every visitor
+# of the deployed app. A fixed id like "default" would make all browsers share
+# (and clear) the same conversation, so each browser session gets its own id.
+if "session_id" not in st.session_state:
+    st.session_state.session_id = uuid.uuid4().hex
+
+SESSION_ID = st.session_state.session_id
 MEMORY_CONFIG = {"configurable": {"session_id": SESSION_ID}}
 
 
